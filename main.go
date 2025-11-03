@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"gator/internal/config"
@@ -179,13 +180,79 @@ func handlerUsers(s *state, cmd command) error {
 	return nil
 }
 
-func handlerAgg(s *state, cmd command) error {
-	feed, err := fetchFeed(context.Background(), "https://www.wagslane.dev/index.xml")
+func scrapeFeeds(s *state) error {
+	feed, err := s.db.GetNextFeedToFetch(context.Background())
+	if err != nil {
+		return fmt.Errorf("couldn't get next feed: %w", err)
+	}
+
+	err = s.db.MarkFeedFetched(context.Background(), feed.ID)
+	if err != nil {
+		return fmt.Errorf("couldn't mark feed as fetched: %w", err)
+	}
+
+	rssFeed, err := fetchFeed(context.Background(), feed.Url)
 	if err != nil {
 		return fmt.Errorf("couldn't fetch feed: %w", err)
 	}
-	fmt.Printf("%+v\n", feed)
+
+	for _, item := range rssFeed.Channel.Item {
+		publishedAt := sql.NullTime{}
+		if item.PubDate != "" {
+			t, err := time.Parse(time.RFC1123Z, item.PubDate)
+			if err != nil {
+				t, err = time.Parse(time.RFC1123, item.PubDate)
+				if err != nil {
+					log.Printf("couldn't parse date %s: %v", item.PubDate, err)
+				} else {
+					publishedAt = sql.NullTime{Time: t, Valid: true}
+				}
+			} else {
+				publishedAt = sql.NullTime{Time: t, Valid: true}
+			}
+		}
+
+		_, err = s.db.CreatePost(context.Background(), database.CreatePostParams{
+			ID:          uuid.New(),
+			CreatedAt:   time.Now(),
+			UpdatedAt:   time.Now(),
+			Title:       item.Title,
+			Url:         item.Link,
+			Description: sql.NullString{String: item.Description, Valid: item.Description != ""},
+			PublishedAt: publishedAt,
+			FeedID:      feed.ID,
+		})
+		if err != nil {
+			if !strings.Contains(err.Error(), "duplicate key") {
+				log.Printf("couldn't create post: %v", err)
+			}
+		}
+	}
+
 	return nil
+}
+
+
+
+func handlerAgg(s *state, cmd command) error {
+	if len(cmd.args) == 0 {
+		return fmt.Errorf("usage: %s <time_between_reqs>", cmd.name)
+	}
+
+	timeBetweenRequests, err := time.ParseDuration(cmd.args[0])
+	if err != nil {
+		return fmt.Errorf("invalid duration: %w", err)
+	}
+
+	fmt.Printf("Collecting feeds every %s\n", timeBetweenRequests)
+
+	ticker := time.NewTicker(timeBetweenRequests)
+	for ; ; <-ticker.C {
+		err := scrapeFeeds(s)
+		if err != nil {
+			log.Println("Error scraping feeds:", err)
+		}
+	}
 }
 
 func handlerAddFeed(s *state, cmd command, user database.User) error {
@@ -275,6 +342,62 @@ func handlerFollowing(s *state, cmd command, user database.User) error {
 	return nil
 }
 
+func handlerUnfollow(s *state, cmd command, user database.User) error {
+	if len(cmd.args) == 0 {
+		return fmt.Errorf("usage: %s <url>", cmd.name)
+	}
+
+	url := cmd.args[0]
+
+	feed, err := s.db.GetFeedByURL(context.Background(), url)
+	if err != nil {
+		return fmt.Errorf("couldn't find feed: %w", err)
+	}
+
+	err = s.db.DeleteFeedFollow(context.Background(), database.DeleteFeedFollowParams{
+		UserID: user.ID,
+		FeedID: feed.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("couldn't unfollow feed: %w", err)
+	}
+
+	fmt.Println("Feed unfollowed successfully")
+	return nil
+}
+
+func handlerBrowse(s *state, cmd command, user database.User) error {
+	limit := 2
+	if len(cmd.args) > 0 {
+		var err error
+		_, err = fmt.Sscanf(cmd.args[0], "%d", &limit)
+		if err != nil {
+			return fmt.Errorf("invalid limit: %w", err)
+		}
+	}
+
+	posts, err := s.db.GetPostsForUser(context.Background(), database.GetPostsForUserParams{
+		UserID: user.ID,
+		Limit:  int32(limit),
+	})
+	if err != nil {
+		return fmt.Errorf("couldn't get posts: %w", err)
+	}
+
+	for _, post := range posts {
+		fmt.Printf("Title: %s\nURL: %s\n", post.Title, post.Url)
+		if post.Description.Valid {
+			fmt.Printf("Description: %s\n", post.Description.String)
+		}
+		if post.PublishedAt.Valid {
+			fmt.Printf("Published: %s\n", post.PublishedAt.Time.Format(time.RFC1123))
+		}
+		fmt.Println()
+	}
+
+	return nil
+}
+
 func main() {
 	cfg, err := config.Read()
 	if err != nil {
@@ -305,6 +428,8 @@ func main() {
 	cmds.register("feeds", handlerFeeds)
 	cmds.register("follow", middlewareLoggedIn(handlerFollow))
 	cmds.register("following", middlewareLoggedIn(handlerFollowing))
+	cmds.register("unfollow", middlewareLoggedIn(handlerUnfollow))
+	cmds.register("browse", middlewareLoggedIn(handlerBrowse))
 
 	if len(os.Args) < 2 {
 		log.Fatal("usage: gator <command> [args...]")
